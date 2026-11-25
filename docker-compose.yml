@@ -1,0 +1,125 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: webhook-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-webhook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-webhook}
+      POSTGRES_DB: ${POSTGRES_DB:-webhook_processor}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-webhook} -d ${POSTGRES_DB:-webhook_processor}"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: webhook-migrate
+    command: ["node", "dist/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-webhook}:${POSTGRES_PASSWORD:-webhook}@postgres:5432/${POSTGRES_DB:-webhook_processor}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: webhook-api
+    command: ["node", "dist/main.js"]
+    ports:
+      - "${PORT:-3001}:3001"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-webhook}:${POSTGRES_PASSWORD:-webhook}@postgres:5432/${POSTGRES_DB:-webhook_processor}
+      PG_POOL_MAX: ${PG_POOL_MAX:-20}
+      PORT: 3001
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker-1:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: webhook-worker-1
+    command: ["node", "dist/worker.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-webhook}:${POSTGRES_PASSWORD:-webhook}@postgres:5432/${POSTGRES_DB:-webhook_processor}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+      WORKER_ID: worker-1
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-500}
+      LEASE_MS: ${LEASE_MS:-15000}
+      HEARTBEAT_MS: ${HEARTBEAT_MS:-4000}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+      BACKOFF_BASE_MS: ${BACKOFF_BASE_MS:-1000}
+      BACKOFF_MAX_MS: ${BACKOFF_MAX_MS:-15000}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  worker-2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: webhook-worker-2
+    command: ["node", "dist/worker.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-webhook}:${POSTGRES_PASSWORD:-webhook}@postgres:5432/${POSTGRES_DB:-webhook_processor}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+      WORKER_ID: worker-2
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-500}
+      LEASE_MS: ${LEASE_MS:-15000}
+      HEARTBEAT_MS: ${HEARTBEAT_MS:-4000}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+      BACKOFF_BASE_MS: ${BACKOFF_BASE_MS:-1000}
+      BACKOFF_MAX_MS: ${BACKOFF_MAX_MS:-15000}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+    container_name: webhook-web
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  pgdata:
