@@ -1,8 +1,8 @@
 import { Module } from '@nestjs/common';
 import { LoggerModule } from 'nestjs-pino';
-import { DbModule } from '../db/db.module';
-import { WorkerRepository } from './worker.repository';
-import { WorkerRunner } from './worker.runner';
+import { DbModule } from './db/db.module';
+import { WorkerRepository } from './worker/worker.repository';
+import { WorkerRunner } from './worker/worker.runner';
 
 @Module({
   imports: [

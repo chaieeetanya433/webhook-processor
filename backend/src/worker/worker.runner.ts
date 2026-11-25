@@ -88,7 +88,9 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
     if (this.stopping) {
       return;
     }
-    const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(this.config.POLL_INTERVAL_MS * 0.3)));
+    const jitter = Math.floor(
+      Math.random() * Math.max(1, Math.floor(this.config.POLL_INTERVAL_MS * 0.3)),
+    );
     const delay = this.config.POLL_INTERVAL_MS + jitter;
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -157,10 +159,7 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
           this.inFlight.add(task);
         }
       } catch (err) {
-        this.logger.error(
-          { workerId: this.config.WORKER_ID, err },
-          'Error in worker poll tick',
-        );
+        this.logger.error({ workerId: this.config.WORKER_ID, err }, 'Error in worker poll tick');
       }
 
       if (!claimedAny || this.inFlight.size >= this.config.WORKER_CONCURRENCY) {
@@ -172,7 +171,9 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
   private async processEvent(claimed: ClaimedEvent): Promise<void> {
     const data = claimed.payload.data as { orderId?: string; simulate?: string } | undefined;
     const orderId = typeof data?.orderId === 'string' ? data.orderId : 'unknown-order';
-    const directive = parseSimulation(typeof data?.simulate === 'string' ? data.simulate : undefined);
+    const directive = parseSimulation(
+      typeof data?.simulate === 'string' ? data.simulate : undefined,
+    );
 
     if (directive.kind === 'ok' && directive.warning) {
       this.logger.warn(
@@ -233,11 +234,7 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
 
     let outcome;
     try {
-      outcome = await executeSimulation(
-        directive,
-        claimed.attemptCount,
-        abortController.signal,
-      );
+      outcome = await executeSimulation(directive, claimed.attemptCount, abortController.signal);
     } catch (err) {
       if (abortController.signal.aborted) {
         this.logger.warn(

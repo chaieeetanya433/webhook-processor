@@ -58,7 +58,10 @@ export class WebhooksService {
         'Duplicate eventId received with conflicting payload; original payload retained',
       );
     } else {
-      this.logger.info({ eventId: body.eventId, type: body.type }, 'Duplicate webhook event ignored');
+      this.logger.info(
+        { eventId: body.eventId, type: body.type },
+        'Duplicate webhook event ignored',
+      );
     }
 
     return {

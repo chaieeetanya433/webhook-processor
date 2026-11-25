@@ -6,7 +6,9 @@ const envSchema = z
     PG_POOL_MAX: z.coerce.number().int().min(1).max(200).default(20),
     PORT: z.coerce.number().int().min(1).max(65535).default(3001),
     CORS_ORIGIN: z.string().min(1).default('http://localhost:3000'),
-    LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+    LOG_LEVEL: z
+      .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+      .default('info'),
     WORKER_ID: z.string().trim().min(1).default('worker-1'),
     WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(64).default(4),
     POLL_INTERVAL_MS: z.coerce.number().int().min(10).max(60000).default(500),
@@ -51,7 +53,9 @@ const migrationEnvSchema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
 });
 
-export function loadMigrationConfig(env: NodeJS.ProcessEnv = process.env): { DATABASE_URL: string } {
+export function loadMigrationConfig(env: NodeJS.ProcessEnv = process.env): {
+  DATABASE_URL: string;
+} {
   const parsed = migrationEnvSchema.safeParse(env);
   if (!parsed.success) {
     throw new Error('Invalid environment configuration: DATABASE_URL is required');
