@@ -14,6 +14,7 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
   private readonly inFlight = new Set<Promise<void>>();
   private wakeResolver: (() => void) | null = null;
   private completionHooks?: CompletionHooks;
+  private heartbeatEnabled = true;
 
   constructor(
     @Inject(APP_CONFIG) private readonly config: AppConfig,
@@ -25,6 +26,10 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
 
   setCompletionHooks(hooks: CompletionHooks | undefined): void {
     this.completionHooks = hooks;
+  }
+
+  setHeartbeatEnabled(enabled: boolean): void {
+    this.heartbeatEnabled = enabled;
   }
 
   onModuleInit(): void {
@@ -104,6 +109,26 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
     while (!this.stopping) {
       let claimedAny = false;
       try {
+        // Step A: Reap expired leases across crashed/stalled workers.
+        const reaped = await this.repository.reapExpiredLeases(
+          this.config.MAX_ATTEMPTS,
+          this.config.BACKOFF_BASE_MS,
+          this.config.BACKOFF_MAX_MS,
+        );
+        for (const item of reaped) {
+          this.logger.warn(
+            {
+              workerId: this.config.WORKER_ID,
+              eventId: item.eventId,
+              attempt: item.attemptNumber,
+              previousWorkerId: item.previousWorkerId,
+              newStatus: item.newStatus,
+            },
+            'Reaped expired event lease',
+          );
+        }
+
+        // Step B: Claim up to WORKER_CONCURRENCY events.
         while (!this.stopping && this.inFlight.size < this.config.WORKER_CONCURRENCY) {
           const claimed = await this.repository.claimNextEvent(
             this.config.WORKER_ID,
@@ -113,10 +138,22 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
             break;
           }
           claimedAny = true;
-          const task = this.processEvent(claimed).finally(() => {
-            this.inFlight.delete(task);
-            this.wake();
-          });
+          const task = this.processEvent(claimed)
+            .catch((err: unknown) => {
+              this.logger.error(
+                {
+                  workerId: this.config.WORKER_ID,
+                  eventId: claimed.eventId,
+                  attempt: claimed.attemptCount,
+                  err,
+                },
+                'Unhandled error while processing claimed event',
+              );
+            })
+            .finally(() => {
+              this.inFlight.delete(task);
+              this.wake();
+            });
           this.inFlight.add(task);
         }
       } catch (err) {
@@ -150,11 +187,75 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
     }
 
     const abortController = new AbortController();
-    const outcome = await executeSimulation(
-      directive,
-      claimed.attemptCount,
-      abortController.signal,
-    );
+    let heartbeatInFlight = false;
+    const heartbeatTimer = this.heartbeatEnabled
+      ? setInterval(() => {
+          if (heartbeatInFlight || abortController.signal.aborted) {
+            return;
+          }
+          heartbeatInFlight = true;
+          void this.repository
+            .extendLease(
+              claimed.eventId,
+              this.config.WORKER_ID,
+              claimed.attemptCount,
+              this.config.LEASE_MS,
+            )
+            .then((alive) => {
+              if (!alive) {
+                this.logger.warn(
+                  {
+                    workerId: this.config.WORKER_ID,
+                    eventId: claimed.eventId,
+                    attempt: claimed.attemptCount,
+                  },
+                  'Heartbeat lost lease; aborting in-flight execution',
+                );
+                abortController.abort(new Error('Lease lost'));
+              }
+            })
+            .catch((err: unknown) => {
+              this.logger.warn(
+                {
+                  workerId: this.config.WORKER_ID,
+                  eventId: claimed.eventId,
+                  attempt: claimed.attemptCount,
+                  err,
+                },
+                'Heartbeat extension failed',
+              );
+            })
+            .finally(() => {
+              heartbeatInFlight = false;
+            });
+        }, this.config.HEARTBEAT_MS)
+      : null;
+
+    let outcome;
+    try {
+      outcome = await executeSimulation(
+        directive,
+        claimed.attemptCount,
+        abortController.signal,
+      );
+    } catch (err) {
+      if (abortController.signal.aborted) {
+        this.logger.warn(
+          {
+            workerId: this.config.WORKER_ID,
+            eventId: claimed.eventId,
+            attempt: claimed.attemptCount,
+          },
+          'Execution aborted after lease loss; skipping completion',
+        );
+        return;
+      }
+      throw err;
+    } finally {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+    }
 
     if (outcome.succeeded) {
       const res = await this.repository.completeSuccess(

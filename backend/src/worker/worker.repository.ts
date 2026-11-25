@@ -2,6 +2,14 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Pool, PoolClient } from 'pg';
 import { PG_POOL } from '../db/db.module';
 import { EventStatus } from '../db/schema';
+import { computeBackoffDelayMs } from './backoff';
+
+export interface ReapedEvent {
+  eventId: string;
+  attemptNumber: number;
+  previousWorkerId: string | null;
+  newStatus: 'pending' | 'failed_permanent';
+}
 
 export interface ClaimedEvent {
   eventId: string;
@@ -226,6 +234,120 @@ export class WorkerRepository {
 
       await client.query('COMMIT');
       return { fencedOut: false, newStatus };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async extendLease(
+    eventId: string,
+    workerId: string,
+    attemptNumber: number,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE events
+       SET
+         lease_expires_at = now() + ($4 * interval '1 millisecond'),
+         updated_at = now()
+       WHERE event_id = $1
+         AND locked_by = $2
+         AND attempt_count = $3
+         AND status = 'processing'`,
+      [eventId, workerId, attemptNumber, leaseMs],
+    );
+    return result.rowCount === 1;
+  }
+
+  async reapExpiredLeases(
+    maxAttempts: number,
+    backoffBaseMs: number,
+    backoffMaxMs: number,
+    batchSize = 10,
+  ): Promise<ReapedEvent[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const expired = await client.query<{
+        event_id: string;
+        attempt_count: number;
+        attempts_in_budget: number;
+        locked_by: string | null;
+      }>(
+        `SELECT event_id, attempt_count, attempts_in_budget, locked_by
+         FROM events
+         WHERE status = 'processing'
+           AND lease_expires_at < now()
+         ORDER BY lease_expires_at ASC
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1`,
+        [batchSize],
+      );
+
+      const reaped: ReapedEvent[] = [];
+      const abandonReason = 'lease expired (worker presumed dead)';
+
+      for (const row of expired.rows) {
+        await client.query(
+          `UPDATE event_attempts
+           SET
+             finished_at = now(),
+             result = 'abandoned',
+             error = $3
+           WHERE event_id = $1
+             AND attempt_number = $2
+             AND finished_at IS NULL`,
+          [row.event_id, row.attempt_count, abandonReason],
+        );
+
+        const isPermanent = row.attempts_in_budget >= maxAttempts;
+        if (isPermanent) {
+          await client.query(
+            `UPDATE events
+             SET
+               status = 'failed_permanent',
+               completed_at = now(),
+               locked_by = NULL,
+               lease_expires_at = NULL,
+               last_error = $2,
+               updated_at = now()
+             WHERE event_id = $1`,
+            [row.event_id, abandonReason],
+          );
+        } else {
+          const backoffMs = computeBackoffDelayMs(
+            row.attempts_in_budget,
+            backoffBaseMs,
+            backoffMaxMs,
+          );
+          await client.query(
+            `UPDATE events
+             SET
+               status = 'pending',
+               next_run_at = now() + ($2 * interval '1 millisecond'),
+               locked_by = NULL,
+               lease_expires_at = NULL,
+               last_error = $3,
+               updated_at = now()
+             WHERE event_id = $1`,
+            [row.event_id, backoffMs, abandonReason],
+          );
+        }
+
+        reaped.push({
+          eventId: row.event_id,
+          attemptNumber: row.attempt_count,
+          previousWorkerId: row.locked_by,
+          newStatus: isPermanent ? 'failed_permanent' : 'pending',
+        });
+      }
+
+      await client.query('COMMIT');
+      return reaped;
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw err;
