@@ -2,6 +2,7 @@ import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { PinoLogger } from 'nestjs-pino';
 import { AppConfig } from '../config/env';
 import { APP_CONFIG } from '../db/db.module';
+import { computeBackoffDelayMs } from './backoff';
 import { executeSimulation, parseSimulation } from './simulation';
 import { ClaimedEvent, CompletionHooks, WorkerRepository } from './worker.repository';
 
@@ -186,6 +187,51 @@ export class WorkerRunner implements OnModuleInit, OnModuleDestroy {
           'Processed webhook event successfully',
         );
       }
+      return;
     }
+
+    const errorMessage = outcome.error ?? 'Unknown processing failure';
+    const backoffMs = computeBackoffDelayMs(
+      claimed.attemptsInBudget,
+      this.config.BACKOFF_BASE_MS,
+      this.config.BACKOFF_MAX_MS,
+    );
+
+    const failureRes = await this.repository.completeFailure({
+      eventId: claimed.eventId,
+      workerId: this.config.WORKER_ID,
+      attemptNumber: claimed.attemptCount,
+      attemptsInBudget: claimed.attemptsInBudget,
+      maxAttempts: this.config.MAX_ATTEMPTS,
+      backoffMs,
+      errorMessage,
+    });
+
+    if (failureRes.fencedOut) {
+      this.logger.warn(
+        {
+          workerId: this.config.WORKER_ID,
+          eventId: claimed.eventId,
+          attempt: claimed.attemptCount,
+        },
+        'Fenced out during failure completion; stale attempt discarded',
+      );
+      return;
+    }
+
+    this.logger.warn(
+      {
+        workerId: this.config.WORKER_ID,
+        eventId: claimed.eventId,
+        attempt: claimed.attemptCount,
+        attemptsInBudget: claimed.attemptsInBudget,
+        newStatus: failureRes.newStatus,
+        backoffMs: failureRes.newStatus === 'pending' ? backoffMs : undefined,
+        error: errorMessage,
+      },
+      failureRes.newStatus === 'failed_permanent'
+        ? 'Event exhausted retry budget and moved to failed_permanent'
+        : 'Event failed; scheduled for retry with backoff',
+    );
   }
 }

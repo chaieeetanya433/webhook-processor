@@ -152,4 +152,85 @@ export class WorkerRepository {
       client.release();
     }
   }
+
+  async completeFailure(params: {
+    eventId: string;
+    workerId: string;
+    attemptNumber: number;
+    attemptsInBudget: number;
+    maxAttempts: number;
+    backoffMs: number;
+    errorMessage: string;
+  }): Promise<{ fencedOut: boolean; newStatus: 'pending' | 'failed_permanent' }> {
+    const client = await this.pool.connect();
+    const isPermanent = params.attemptsInBudget >= params.maxAttempts;
+    const newStatus = isPermanent ? 'failed_permanent' : 'pending';
+
+    try {
+      await client.query('BEGIN');
+
+      const updateEvent = isPermanent
+        ? await client.query(
+            `UPDATE events
+             SET
+               status = 'failed_permanent',
+               completed_at = now(),
+               locked_by = NULL,
+               lease_expires_at = NULL,
+               last_error = $4,
+               updated_at = now()
+             WHERE event_id = $1
+               AND locked_by = $2
+               AND attempt_count = $3
+               AND status = 'processing'`,
+            [params.eventId, params.workerId, params.attemptNumber, params.errorMessage],
+          )
+        : await client.query(
+            `UPDATE events
+             SET
+               status = 'pending',
+               next_run_at = now() + ($5 * interval '1 millisecond'),
+               locked_by = NULL,
+               lease_expires_at = NULL,
+               last_error = $4,
+               updated_at = now()
+             WHERE event_id = $1
+               AND locked_by = $2
+               AND attempt_count = $3
+               AND status = 'processing'`,
+            [
+              params.eventId,
+              params.workerId,
+              params.attemptNumber,
+              params.errorMessage,
+              params.backoffMs,
+            ],
+          );
+
+      if (updateEvent.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return { fencedOut: true, newStatus };
+      }
+
+      await client.query(
+        `UPDATE event_attempts
+         SET
+           finished_at = now(),
+           result = 'failure',
+           error = $3
+         WHERE event_id = $1
+           AND attempt_number = $2
+           AND finished_at IS NULL`,
+        [params.eventId, params.attemptNumber, params.errorMessage],
+      );
+
+      await client.query('COMMIT');
+      return { fencedOut: false, newStatus };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
